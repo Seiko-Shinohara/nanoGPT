@@ -43,8 +43,16 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
-# data
-dataset = 'openwebtext'
+# data: the *.parquet files of data/<dataset> are streamed directly and
+# tokenized on the fly (GPT-2 BPE via tiktoken) in a background thread
+dataset = 'fineweb-edu'
+train_tokens = -1 # total train tokens to stream from the files (-1 = stream everything)
+val_tokens = 1_000_000 # total val tokens, streamed from the last file(s) after the train split
+text_column = 'text' # parquet column holding the text (plain string, or a {'text': ...} struct)
+tokenizer = 'gpt2' # tiktoken encoding used for on-the-fly tokenization
+parquet_batch_rows = 20_000 # parquet rows read per batch by the streaming loader
+parquet_buffer_tokens = 256_000_000 # in-memory token buffer cap of the streaming loader (uint16, 2 bytes each)
+parquet_workers = 4 # parallel tokenization threads (1 = single thread)
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -53,9 +61,12 @@ n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
-# adamw optimizer
+bias = False # do we use bias inside Linear layers? (RMSNorm has no bias)
+# optimizer: 'adamw' or 'muon' (muon = torch.optim.Muon for 2D hidden-layer weights
+# + AdamW for embeddings, biases and norms)
+optimizer = 'adamw'
 learning_rate = 6e-4 # max learning rate
+muon_lr = 0.02 # max learning rate for Muon (only used when optimizer == 'muon'); Muon typically wants a much higher lr than AdamW
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -65,7 +76,6 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -111,24 +121,47 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
+# streaming parquet data loader: reads data/<dataset>/*.parquet, tokenizes on
+# the fly in a background thread, serves random (x, y) windows
 data_dir = os.path.join('data', dataset)
+from parquet_stream import ParquetStream, plan_parquet_splits
+assert val_tokens > 0, "requires val_tokens > 0"
+train_files, val_files, est_train_tokens = plan_parquet_splits(
+    data_dir, text_column, tokenizer, train_tokens, val_tokens)
+streams = {
+    'train': ParquetStream(train_files, text_column, tokenizer,
+                           token_budget=train_tokens, block_size=block_size,
+                           batch_rows=parquet_batch_rows,
+                           buffer_tokens=parquet_buffer_tokens,
+                           workers=parquet_workers, label='train'),
+    # val only needs to serve eval_iters * batch_size * block_size tokens
+    'val': ParquetStream(val_files, text_column, tokenizer,
+                         token_budget=val_tokens, block_size=block_size,
+                         batch_rows=parquet_batch_rows,
+                         buffer_tokens=min(parquet_buffer_tokens, max(4 * val_tokens, 2_000_000)),
+                         workers=max(1, parquet_workers // 2), label='val'),
+}
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    x, y = streams[split].get_batch(batch_size)
+    x = torch.from_numpy(x)
+    y = torch.from_numpy(y)
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
     return x, y
+# derive the training horizon from the token budget if not set explicitly
+if max_iters < 0:
+    budget = train_tokens if train_tokens > 0 else est_train_tokens
+    max_iters = int(math.ceil(budget / tokens_per_iter))
+    print(f"[parquet] max_iters not set: derived {max_iters:,} from "
+          f"{budget:,} train tokens / {tokens_per_iter:,} tokens per iter")
+    config['max_iters'] = max_iters
+if lr_decay_iters < 0:
+    lr_decay_iters = max_iters
+    print(f"[parquet] lr_decay_iters not set: derived {lr_decay_iters:,} = max_iters")
+    config['lr_decay_iters'] = lr_decay_iters
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -195,10 +228,20 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+# optimizers (a list: Muon training uses two - one per parameter subset)
+optimizers = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type,
+                                       optimizer_name=optimizer, muon_lr=muon_lr)
+# base learning rate of each optimizer, for the LR schedule below
+optimizer_base_lrs = [learning_rate] if optimizer == 'adamw' else [muon_lr, learning_rate]
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    opt_states = checkpoint['optimizer']
+    if not isinstance(opt_states, (list, tuple)):
+        opt_states = [opt_states] # older checkpoints stored a single optimizer state dict
+    if len(opt_states) != len(optimizers):
+        raise ValueError(f"checkpoint has {len(opt_states)} optimizer state(s) but this run "
+                         f"creates {len(optimizers)}; use the same --optimizer value as the original run")
+    for opt, opt_state in zip(optimizers, opt_states):
+        opt.load_state_dict(opt_state)
 checkpoint = None # free up memory
 
 # compile the model
@@ -227,11 +270,12 @@ def estimate_loss():
     model.train()
     return out
 
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
+# learning rate decay scheduler (cosine with warmup), relative to a base learning rate
+def get_lr(it, base_lr):
+    min_lr = base_lr / 10 # minimum learning rate, should be ~= base_lr/10 per Chinchilla
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
+        return base_lr * (it + 1) / (warmup_iters + 1)
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
@@ -239,12 +283,16 @@ def get_lr(it):
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return min_lr + coeff * (base_lr - min_lr)
 
 # logging
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
+# start the streaming parquet producers
+for s in streams.values():
+    s.start()
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -254,10 +302,14 @@ raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    # determine and set the learning rate for this iteration (per optimizer)
+    lr = None
+    for opt, base_lr in zip(optimizers, optimizer_base_lrs):
+        lr_opt = get_lr(iter_num, base_lr) if decay_lr else base_lr
+        for param_group in opt.param_groups:
+            param_group['lr'] = lr_opt
+        if lr is None:
+            lr = lr_opt # for logging
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -276,7 +328,7 @@ while True:
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
+                    'optimizer': [opt.state_dict() for opt in optimizers],
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
@@ -305,13 +357,15 @@ while True:
         scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        scaler.unscale_(optimizers)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
+    # step the optimizers and scaler if training in fp16
+    for opt in optimizers:
+        scaler.step(opt)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+    for opt in optimizers:
+        opt.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
