@@ -48,6 +48,10 @@ else:
     get_batch = lambda split: (x, y)
 
 # model init
+# GPTConfig's architecture defaults are now rmsnorm + swiglu + qk_norm + rope, so this benchmark
+# measures *that* block. SwiGLU is parameter- and flop-matched and rope only removes the wpe
+# lookup, so the TFLOP/s numbers stay comparable to the stock ones. To benchmark the stock GPT-2
+# block instead, add **STOCK_ARCH to the call below.
 gptconf = GPTConfig(
     block_size = block_size, # how far back does the model look? i.e. context size
     n_layer = 12, n_head = 12, n_embd = 768, # size of the model
