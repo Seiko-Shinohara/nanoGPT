@@ -10,3 +10,27 @@ __pycache__/
 input.txt
 env/
 venv/
+
+# machine-local caches and run outputs (see AMD_NOTES.md)
+cache/
+out_fineweb_edu_amd/
+out_fineweb_edu/
+out_verify/
+# every run directory: the checkpoints (*.pt) inside were already ignored
+out_*/
+# TunableOp writes its cache next to amd_opt.py, i.e. the repo root
+tunable_*.json
+tools/tunable_*.json
+# the 31 GB of FineWeb-EDU shards downloaded for data/fineweb-edu/prepare.py
+data/fineweb-edu/*.parquet
+# binaries produced by count_native/build.sh: the .cpp/.h sources are what's tracked
+count_native/count_build
+count_native/*.so
+# the GB-scale n-gram COUNT tables written by count_native/count_build (the *.bin files
+# are already covered above; rebuilding one needs only the flags, which are in the docs)
+count_tables/
+# measurement evidence stays on the box: eval_ledgers, run logs, VRAM-model fit
+eval_results/
+logs/
+tools/vram_model.json
+data/fineweb-edu/domain_*_meta.json
