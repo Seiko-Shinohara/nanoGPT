@@ -1,0 +1,33 @@
+{
+  "docs_scanned": 10317,
+  "docs_too_short": 7,
+  "docs_filtered": 0,
+  "docs_exact_dup": 0,
+  "docs_near_dup": 10,
+  "shards": [
+    "013_00000.parquet"
+  ],
+  "vocab_size": 4096,
+  "marker": "<|docsplit|>",
+  "marker_id": 4095,
+  "byte_ids": 256,
+  "word_pieces": 3839,
+  "piece_byte_overlap": 0.7670169858509005,
+  "tokens_saved_vs_bytes": 18469782,
+  "docs_train": 2949,
+  "docs_val": 782,
+  "tokens_train": 4194304,
+  "tokens_val": 1048576,
+  "chars_norm_per_token": 2.4173599243164063,
+  "chars_raw_per_token": 2.4174131393432616,
+  "tokens_per_vocab_entry": 1024.0,
+  "word_token_share": 0.28513121604919434,
+  "byte_fallback_share": 0.7141659259796143,
+  "marker_share": 0.0007028579711914062,
+  "min_density": 0.0,
+  "near_dup_threshold": 0.5,
+  "max_chars": 6000,
+  "keywords": [],
+  "seed": 42,
+  "wall_seconds": 16.942506551742554
+}
